@@ -1,0 +1,94 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="light dark">
+  <title>ShareThis</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+<main class="app">
+  <header class="top">
+    <h1>ShareThis</h1>
+    <p class="me">
+      You are <strong class="my-name">…</strong>
+      <span id="conn-status" class="conn" role="status"></span>
+    </p>
+  </header>
+
+  <!-- Home -->
+  <section id="view-home" class="view" aria-labelledby="home-heading">
+    <h2 id="home-heading" class="visually-hidden" tabindex="-1">Home</h2>
+    <div id="home-actions" class="stack">
+      <button id="btn-upload" class="big primary" type="button">Upload</button>
+      <button id="btn-download" class="big" type="button">Download</button>
+    </div>
+    <p id="unsupported" class="card error" hidden>
+      This browser doesn't support WebRTC, which ShareThis needs to send files directly between devices.
+      Please try a recent version of Chrome, Edge, Firefox or Safari.
+    </p>
+  </section>
+
+  <!-- Upload (sender) -->
+  <section id="view-upload" class="view" aria-labelledby="upload-heading" hidden>
+    <button id="upload-back" class="back" type="button">← Back</button>
+    <h2 id="upload-heading" tabindex="-1">Send files</h2>
+
+    <input id="file-input" class="visually-hidden" type="file" multiple>
+    <label for="file-input" class="button pick">Choose files</label>
+    <p id="selected-summary" class="muted"></p>
+    <ul id="selected-files" class="file-list"></ul>
+
+    <h3>Send to</h3>
+    <p id="receivers-hint" class="muted" hidden>Choose files first, then tap a device.</p>
+    <p id="receivers-empty" class="muted">
+      No devices are ready to receive. On the other device, open this page and tap <strong>Download</strong>.
+    </p>
+    <ul id="receivers" class="peer-list"></ul>
+
+    <div id="waiting" class="card" hidden>
+      <p id="waiting-text" aria-live="polite"></p>
+      <button id="btn-cancel-request" type="button">Cancel request</button>
+    </div>
+  </section>
+
+  <!-- Download (receiver) -->
+  <section id="view-download" class="view" aria-labelledby="download-heading" hidden>
+    <button id="download-back" class="back" type="button">← Back</button>
+    <h2 id="download-heading" tabindex="-1">Ready to receive</h2>
+
+    <div id="download-idle" class="waiting-box">
+      <div class="pulse" aria-hidden="true"></div>
+      <p>Senders on this Wi-Fi can see you as <strong class="my-name">…</strong>.<br>Keep this page open.</p>
+    </div>
+
+    <div id="incoming" class="card" role="alertdialog" aria-labelledby="incoming-title" hidden>
+      <p id="incoming-title" class="incoming-title"></p>
+      <ul id="incoming-files" class="file-list"></ul>
+      <div class="row">
+        <button id="btn-decline" type="button">Decline</button>
+        <button id="btn-accept" class="primary" type="button">Accept</button>
+      </div>
+    </div>
+  </section>
+
+  <!-- Transfer (both sides) -->
+  <section id="view-transfer" class="view" aria-labelledby="transfer-title" hidden>
+    <h2 id="transfer-title" tabindex="-1"></h2>
+    <p id="transfer-status" class="status" aria-live="polite"></p>
+    <p id="transfer-route" class="muted small"></p>
+    <progress id="transfer-progress" max="1" value="0"></progress>
+    <p id="transfer-stats" class="muted small"></p>
+    <ul id="transfer-files" class="file-list"></ul>
+    <div class="row">
+      <button id="btn-disconnect" class="danger" type="button">Disconnect</button>
+      <button id="btn-transfer-home" type="button" hidden>Back to home</button>
+    </div>
+  </section>
+
+  <div id="toast" class="toast" role="status" aria-live="polite" hidden></div>
+</main>
+<script src="app.js"></script>
+</body>
+</html>
