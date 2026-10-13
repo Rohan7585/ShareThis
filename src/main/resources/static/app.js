@@ -14,6 +14,9 @@
  * STUN server), and trickles them to the other side as they are found. The browsers then test
  * candidate pairs and use the first one that works. On the same Wi-Fi that is normally host ↔ host,
  * so the bytes go straight across the router.
+ *
+ * The data channel stays open after the first files arrive, so the sender can keep offering more and
+ * the receiver approves them one by one or all at once (see "WebRTC session" below).
  */
 
 const CHUNK_MAX = 64 * 1024;
@@ -341,7 +344,12 @@ function sanitizeFiles(list) {
   const files = [];
   for (const f of list) {
     if (!f || typeof f.name !== 'string' || !Number.isSafeInteger(f.size) || f.size < 0) return null;
-    files.push({ name: f.name.slice(0, 255) || 'file', size: f.size, type: typeof f.type === 'string' ? f.type : '' });
+    files.push({
+      id: Number.isSafeInteger(f.id) ? f.id : null, // only set in offers over the data channel
+      name: f.name.slice(0, 255) || 'file',
+      size: f.size,
+      type: typeof f.type === 'string' ? f.type : '',
+    });
   }
   return files;
 }
@@ -368,42 +376,52 @@ function acceptIncoming() {
 }
 
 // ---------------------------------------------------------------- WebRTC session
+//
+// Once the data channel is open it stays open until someone disconnects, and the sender can offer
+// more files at any time. Control messages are JSON strings; file bytes are binary messages.
+//   sender → receiver:  offer {files: [{id, name, size, type}]}, start {id}, <chunks…>, end {id}
+//   receiver → sender:  accept {ids}, decline {ids}, got {id} (the file arrived completely)
+//   either direction:   cancel (the other side is disconnecting)
+// Accepted files are sent one at a time, in the order they were accepted.
 
 const FILE_STATES = {
-  waiting: 'Waiting',
+  offered: 'Waiting for approval',
+  queued: 'Queued',
   sending: 'Sending…',
   sent: 'Sent',
   receiving: 'Receiving…',
   received: 'Received',
+  declined: 'Declined',
   cancelled: 'Not completed',
 };
+const ACTIVE_STATES = new Set(['queued', 'sending', 'receiving']);
+const FINAL_STATES = new Set(['sent', 'received', 'declined']);
 
-function createSession(role, peerId, peerName, files) {
+function createSession(role, peerId, peerName) {
   const s = {
     role, peerId, peerName,
-    files,                    // [{ name, size, type }]
-    fileObjs: null,           // sender only: the File objects
+    files: [],                // one entry per offered file, in offer order; see addFile()
+    byId: new Map(),          // file id -> entry
+    nextId: 0,                // sender: id for the next offered file
+    queue: [],                // sender: accepted entries not sent yet
+    pumping: false,           // sender: pumpQueue() is running
+    autoAccept: role === 'receive', // receiver: the first offer was already accepted in the request dialog
+    current: null,            // receiver: { entry, chunks } for the file being received
+    chunkSize: CHUNK_MAX,
     pc: null,
     channel: null,
     channelOpen: false,
     closed: false,
-    finished: false,          // all files delivered (sender got "ack" / receiver got "done")
     pendingCandidates: [],    // ICE candidates that arrived before the remote description
     signalQueue: Promise.resolve(),
-    totalBytes: totalSize(files),
     bytes: 0,                 // sender: bytes handed to send(); receiver: bytes received
-    fileEnds: [],             // sender: value of `bytes` right after file i was fully queued
-    current: null,            // receiver: { i, chunks } for the file being received
-    fileState: files.map(() => 'waiting'),
-    rows: [],
     connectTimer: null,
     progressTimer: null,
     wakeSender: null,         // resolves a pending waitForDrain()
-    startTime: 0,
     speed: { value: 0, lastBytes: 0, lastTime: 0 },
   };
   state.session = s;
-  setMode('busy'); // disappear from other senders' lists while we're occupied
+  setMode('busy'); // disappear from other senders' lists for as long as we're connected
   renderTransferView(s);
   showView('transfer');
 
@@ -413,6 +431,18 @@ function createSession(role, peerId, peerName, files) {
   }, CONNECT_TIMEOUT_MS);
   return s;
 }
+
+/** Adds a file to the session and to the transfer list. meta = { id, name, size, type, file? }. */
+function addFile(s, meta) {
+  const entry = { ...meta, state: null, accepted: false, startBytes: 0, received: 0, url: null, row: fileRow(meta) };
+  s.files.push(entry);
+  s.byId.set(entry.id, entry);
+  if (state.session === s) $('transfer-files').append(entry.row.li);
+  setFileState(s, entry, 'offered');
+  return entry;
+}
+
+const isBusy = (s) => s.files.some((e) => ACTIVE_STATES.has(e.state));
 
 function cannotConnectMessage(s) {
   return `Couldn't connect directly to ${s.peerName}. Check that both devices are on the same Wi-Fi ` +
@@ -437,11 +467,11 @@ function sendSignal(s, data) {
   if (!s.closed) wsSend({ type: 'signal', to: s.peerId, data });
 }
 
+const fileMeta = (file, id) => ({ id, name: file.name, size: file.size, type: file.type, file });
+
 async function startSending(peerId, peerName) {
-  const fileObjs = state.files.slice();
-  const meta = fileObjs.map((f) => ({ name: f.name, size: f.size, type: f.type }));
-  const s = createSession('send', peerId, peerName, meta);
-  s.fileObjs = fileObjs;
+  const s = createSession('send', peerId, peerName);
+  state.files.forEach((file) => addFile(s, fileMeta(file, s.nextId++)));
 
   // The offering side creates the channel; the other side gets it via the "datachannel" event.
   // ordered: true gives reliable, in-order delivery (like TCP), which is what file data needs.
@@ -455,7 +485,7 @@ async function startSending(peerId, peerName) {
 }
 
 function startReceiving(request) {
-  const s = createSession('receive', request.peerId, request.peerName, request.files);
+  const s = createSession('receive', request.peerId, request.peerName);
   s.pc.ondatachannel = (event) => setupChannel(s, event.channel);
 }
 
@@ -504,8 +534,8 @@ function setupChannel(s, channel) {
   channel.onopen = () => onChannelOpen(s);
   channel.onmessage = (event) => onChannelMessage(s, event.data);
   channel.onclose = () => {
-    if (s.finished) closeSession(s, `Connection to ${s.peerName} closed.`);
-    else failSession(s, `Connection to ${s.peerName} was lost.`);
+    if (isBusy(s)) failSession(s, `Connection to ${s.peerName} was lost.`);
+    else closeSession(s, `Connection to ${s.peerName} closed.`);
   };
   if (channel.readyState === 'open') onChannelOpen(s);
 }
@@ -514,46 +544,130 @@ function onChannelOpen(s) {
   if (s.channelOpen || s.closed) return;
   s.channelOpen = true;
   clearTimeout(s.connectTimer);
-  setStatus(s, s.role === 'send' ? `Sending to ${s.peerName}…` : `Receiving from ${s.peerName}…`);
-  s.startTime = s.speed.lastTime = performance.now();
+  s.speed.lastTime = performance.now();
   s.progressTimer = setInterval(() => renderProgress(s), PROGRESS_INTERVAL_MS);
   showRoute(s);
   if (s.role === 'send') {
-    runSender(s).catch((err) => {
-      if (!s.closed) failSession(s, `Sending failed: ${err.message}`);
-    });
+    // SCTP (the protocol under data channels) advertises the largest message the peer accepts.
+    const maxMessage = s.pc.sctp && s.pc.sctp.maxMessageSize;
+    s.chunkSize = maxMessage > 0 ? Math.min(CHUNK_MAX, maxMessage) : CHUNK_MAX;
+    if (state.session === s) $('send-more').hidden = false;
+    offerFiles(s, s.files);
   }
+  updateStatus(s);
+  renderProgress(s);
 }
 
 function sendControl(s, msg) {
-  s.channel.send(JSON.stringify(msg));
+  if (s.channel && s.channel.readyState === 'open') s.channel.send(JSON.stringify(msg));
 }
 
-async function runSender(s) {
-  const channel = s.channel;
-  // SCTP (the protocol under data channels) advertises the largest message the peer accepts.
-  const maxMessage = s.pc.sctp && s.pc.sctp.maxMessageSize;
-  const chunkSize = maxMessage > 0 ? Math.min(CHUNK_MAX, maxMessage) : CHUNK_MAX;
-
-  for (let i = 0; i < s.fileObjs.length; i++) {
-    const file = s.fileObjs[i];
-    sendControl(s, { t: 'start', i });
-    setFileState(s, i, 'sending');
-    for (let offset = 0; offset < file.size; offset += chunkSize) {
-      // Backpressure: send() only queues data inside the browser. Without pausing, a large file
-      // would be queued in memory all at once, and Chrome closes the channel when its queue overflows.
-      if (channel.bufferedAmount > HIGH_WATER_MARK) await waitForDrain(s);
-      if (s.closed) return;
-      const chunk = await file.slice(offset, offset + chunkSize).arrayBuffer();
-      if (s.closed) return;
-      channel.send(chunk);
-      s.bytes += chunk.byteLength;
+function onChannelMessage(s, data) {
+  if (s.closed) return;
+  if (typeof data !== 'string') {
+    // Binary = a chunk of the file being received.
+    const current = s.current;
+    if (current) {
+      current.chunks.push(data);
+      current.entry.received += data.byteLength;
+      s.bytes += data.byteLength;
     }
-    sendControl(s, { t: 'end', i });
-    s.fileEnds[i] = s.bytes;
+    return;
   }
-  sendControl(s, { t: 'done' });
-  setStatus(s, `Waiting for ${s.peerName} to confirm…`);
+
+  let msg;
+  try { msg = JSON.parse(data); } catch { return; }
+  if (!msg || typeof msg !== 'object') return;
+  const entry = s.byId.get(msg.id);
+  const receiving = s.role === 'receive';
+  switch (msg.t) {
+    case 'offer':
+      if (receiving) onOffer(s, msg.files);
+      break;
+    case 'start':
+      if (receiving && entry && entry.state === 'queued' && !s.current) {
+        s.current = { entry, chunks: [] };
+        setFileState(s, entry, 'receiving');
+        updateStatus(s);
+      }
+      break;
+    case 'end':
+      if (s.current && s.current.entry === entry) finishFile(s);
+      break;
+    case 'accept':
+    case 'decline':
+      if (!receiving) onAnswer(s, msg.ids, msg.t === 'accept');
+      break;
+    case 'got':
+      if (!receiving && entry && entry.state === 'sending') {
+        setFileState(s, entry, 'sent');
+        updateStatus(s);
+      }
+      break;
+    case 'cancel':
+      closeSession(s, `${s.peerName} closed the connection.`);
+      break;
+  }
+}
+
+// ---- sender side
+
+/** Picked with "Send more files" while connected. */
+function sendMoreFiles(fileList) {
+  const s = state.session;
+  if (!s || s.closed || !s.channelOpen || s.role !== 'send') return;
+  const entries = Array.from(fileList, (file) => addFile(s, fileMeta(file, s.nextId++)));
+  if (entries.length) offerFiles(s, entries);
+}
+
+function offerFiles(s, entries) {
+  sendControl(s, { t: 'offer', files: entries.map(({ id, name, size, type }) => ({ id, name, size, type })) });
+  updateStatus(s);
+}
+
+function onAnswer(s, ids, accepted) {
+  if (!Array.isArray(ids)) return;
+  for (const id of ids) {
+    const entry = s.byId.get(id);
+    if (!entry || entry.state !== 'offered') continue;
+    entry.accepted = accepted;
+    setFileState(s, entry, accepted ? 'queued' : 'declined');
+    if (accepted) s.queue.push(entry);
+  }
+  updateStatus(s);
+  pumpQueue(s);
+}
+
+/** Sends accepted files one after another. Does nothing if it's already running. */
+async function pumpQueue(s) {
+  if (s.pumping) return;
+  s.pumping = true;
+  try {
+    while (s.queue.length && !s.closed) await sendFile(s, s.queue.shift());
+  } catch (err) {
+    if (!s.closed) failSession(s, `Sending failed: ${err.message}`);
+  } finally {
+    s.pumping = false;
+  }
+}
+
+async function sendFile(s, entry) {
+  const channel = s.channel;
+  sendControl(s, { t: 'start', id: entry.id });
+  entry.startBytes = s.bytes;
+  setFileState(s, entry, 'sending');
+  updateStatus(s);
+  for (let offset = 0; offset < entry.size; offset += s.chunkSize) {
+    // Backpressure: send() only queues data inside the browser. Without pausing, a large file
+    // would be queued in memory all at once, and Chrome closes the channel when its queue overflows.
+    if (channel.bufferedAmount > HIGH_WATER_MARK) await waitForDrain(s);
+    if (s.closed) return;
+    const chunk = await entry.file.slice(offset, offset + s.chunkSize).arrayBuffer();
+    if (s.closed) return;
+    channel.send(chunk);
+    s.bytes += chunk.byteLength;
+  }
+  sendControl(s, { t: 'end', id: entry.id });
 }
 
 function waitForDrain(s) {
@@ -571,75 +685,65 @@ function waitForDrain(s) {
   });
 }
 
-function onChannelMessage(s, data) {
-  if (s.closed) return;
-  if (typeof data !== 'string') {
-    // Binary = a chunk of the current file.
-    if (s.current) {
-      s.current.chunks.push(data);
-      s.bytes += data.byteLength;
-    }
+// ---- receiver side
+
+function onOffer(s, list) {
+  const files = sanitizeFiles(list);
+  if (!files) return;
+  const ids = new Set(files.map((f) => f.id));
+  if (ids.size !== files.length || files.some((f) => f.id == null || s.byId.has(f.id))) return;
+
+  const entries = files.map((f) => addFile(s, f));
+  if (s.autoAccept) {
+    // The first batch is the one we already accepted in the request dialog.
+    s.autoAccept = false;
+    respond(s, entries, true);
     return;
   }
+  renderPending(s);
+  updateStatus(s);
+  toast(`${s.peerName} wants to send ${plural(entries.length, 'more file')}.`);
+  if (navigator.vibrate) navigator.vibrate(200);
+}
 
-  let msg;
-  try { msg = JSON.parse(data); } catch { return; }
-  const validIndex = Number.isInteger(msg.i) && msg.i >= 0 && msg.i < s.files.length;
-  switch (msg.t) {
-    case 'start':
-      if (s.role === 'receive' && validIndex) {
-        s.current = { i: msg.i, chunks: [] };
-        setFileState(s, msg.i, 'receiving');
-      }
-      break;
-    case 'end':
-      if (s.current && s.current.i === msg.i) finishFile(s);
-      break;
-    case 'done':
-      if (s.role === 'receive' && !s.finished) {
-        s.finished = true;
-        sendControl(s, { t: 'ack' });
-        finishTransfer(s, `Received ${plural(s.files.length, 'file')} from ${s.peerName}. Tap Save to keep them.`);
-      }
-      break;
-    case 'ack':
-      if (s.role === 'send' && !s.finished) {
-        s.finished = true;
-        s.files.forEach((_, i) => setFileState(s, i, 'sent'));
-        finishTransfer(s, `Sent. ${s.peerName} received all files.`);
-      }
-      break;
-    case 'cancel':
-      closeSession(s, `${s.peerName} closed the connection.`);
-      break;
-  }
+/** Accepts or declines files that are still waiting for an answer. */
+function respond(s, entries, accept) {
+  const open = entries.filter((e) => e.state === 'offered');
+  if (s.closed || open.length === 0) return;
+  open.forEach((e) => {
+    e.accepted = accept;
+    setFileState(s, e, accept ? 'queued' : 'declined');
+  });
+  sendControl(s, { t: accept ? 'accept' : 'decline', ids: open.map((e) => e.id) });
+  renderPending(s);
+  updateStatus(s);
+  renderProgress(s);
+}
+
+function respondAll(accept) {
+  const s = state.session;
+  if (s && s.role === 'receive') respond(s, s.files, accept);
+}
+
+function respondOne(s, entry, accept) {
+  respond(s, [entry], accept);
+  // The clicked button is gone now; move focus on to the next file that needs an answer.
+  const next = s.files.find((e) => e.state === 'offered');
+  (next ? next.row.actions.querySelector('.primary') : $('transfer-title')).focus();
 }
 
 // Types a browser might render (and run scripts in) if a blob: URL were opened as a page.
 const UNSAFE_TYPE = /html|xml|javascript|ecmascript/i;
 
 function finishFile(s) {
-  const { i, chunks } = s.current;
+  const { entry, chunks } = s.current;
   s.current = null;
-  const meta = s.files[i];
-  const type = !meta.type || UNSAFE_TYPE.test(meta.type) ? 'application/octet-stream' : meta.type;
-  const url = URL.createObjectURL(new Blob(chunks, { type }));
-  state.objectUrls.push(url);
-
-  const link = el('a', 'save', 'Save');
-  link.href = url;
-  link.download = meta.name;
-  link.setAttribute('aria-label', `Save ${meta.name}`);
-  s.rows[i].actions.append(link);
-  setFileState(s, i, 'received');
-}
-
-function finishTransfer(s, message) {
-  clearInterval(s.progressTimer);
-  renderProgress(s);
-  setStatus(s, message);
-  // The transfer is over, but the connection stays open until someone taps Disconnect.
-  setMode('idle');
+  const type = !entry.type || UNSAFE_TYPE.test(entry.type) ? 'application/octet-stream' : entry.type;
+  entry.url = URL.createObjectURL(new Blob(chunks, { type }));
+  state.objectUrls.push(entry.url);
+  setFileState(s, entry, 'received');
+  sendControl(s, { t: 'got', id: entry.id });
+  updateStatus(s);
 }
 
 /**
@@ -653,11 +757,12 @@ function closeSession(s, message, { notify = false, error = false } = {}) {
   clearInterval(s.progressTimer);
 
   if (notify) {
-    try { if (s.channel && s.channel.readyState === 'open') sendControl(s, { t: 'cancel' }); } catch { /* closing anyway */ }
+    try { sendControl(s, { t: 'cancel' }); } catch { /* closing anyway */ }
     wsSend({ type: 'cancel', to: s.peerId });
   }
   if (s.wakeSender) s.wakeSender();
   s.current = null; // drop a partly received file
+  s.queue = [];
 
   if (s.channel) {
     s.channel.onclose = null;
@@ -672,13 +777,15 @@ function closeSession(s, message, { notify = false, error = false } = {}) {
     setTimeout(() => pc.close(), 500);
   }
 
-  s.fileState.forEach((st, i) => {
-    if (st !== 'sent' && st !== 'received') setFileState(s, i, 'cancelled');
+  s.files.forEach((e) => {
+    if (!FINAL_STATES.has(e.state)) setFileState(s, e, 'cancelled');
   });
   if (s.channelOpen) renderProgress(s);
   setStatus(s, message, error);
 
   if (state.session === s) {
+    $('pending').hidden = true;
+    $('send-more').hidden = true;
     $('btn-disconnect').hidden = true;
     $('btn-transfer-home').hidden = false;
     $('btn-transfer-home').focus();
@@ -736,10 +843,10 @@ function renderTransferView(s) {
   setStatus(s, 'Connecting directly…');
   $('transfer-route').textContent = '';
   $('transfer-progress').value = 0;
-  $('transfer-stats').textContent = `0 B of ${formatBytes(s.totalBytes)}`;
-  s.rows = s.files.map((f) => fileRow(f));
-  s.files.forEach((_, i) => setFileState(s, i, 'waiting'));
-  $('transfer-files').replaceChildren(...s.rows.map((row) => row.li));
+  $('transfer-stats').textContent = '';
+  $('transfer-files').replaceChildren();
+  $('pending').hidden = true;
+  $('send-more').hidden = true;
   $('btn-disconnect').hidden = false;
   $('btn-transfer-home').hidden = true;
 }
@@ -751,25 +858,85 @@ function setStatus(s, text, error = false) {
   status.classList.toggle('error', error);
 }
 
-function setFileState(s, i, fileState) {
-  s.fileState[i] = fileState;
-  const row = s.rows[i];
-  row.li.dataset.state = fileState;
-  row.meta.textContent = `${formatBytes(s.files[i].size)} · ${FILE_STATES[fileState]}`;
+/** Describes what's going on right now, once connected. */
+function updateStatus(s) {
+  if (s.closed || !s.channelOpen) return;
+  const name = s.peerName;
+  const sending = s.role === 'send';
+  const waiting = s.files.filter((e) => e.state === 'offered').length;
+  let text;
+  if (isBusy(s)) {
+    text = sending ? `Sending to ${name}…` : `Receiving from ${name}…`;
+  } else if (waiting) {
+    text = sending
+      ? `Waiting for ${name} to approve ${plural(waiting, 'file')}…`
+      : `${name} wants to send you ${plural(waiting, 'file')}.`;
+  } else if (sending) {
+    text = `Connected to ${name}. You can send more files.`;
+  } else {
+    text = s.files.some((e) => e.state === 'received')
+      ? `Connected to ${name}. Tap Save to keep files; more can arrive any time.`
+      : `Connected to ${name}. New files will show up here.`;
+  }
+  setStatus(s, text);
+}
+
+/** The "Accept all / Decline all" bar for files waiting for an answer. */
+function renderPending(s) {
+  if (state.session !== s) return;
+  const waiting = s.role === 'receive' && !s.closed ? s.files.filter((e) => e.state === 'offered') : [];
+  $('pending').hidden = waiting.length === 0;
+  $('pending-text').textContent = `${plural(waiting.length, 'new file')} waiting · ${formatBytes(totalSize(waiting))}`;
+}
+
+function setFileState(s, entry, fileState) {
+  entry.state = fileState;
+  const { li, meta, actions } = entry.row;
+  li.dataset.state = fileState;
+  const label = s.role === 'receive' && fileState === 'offered' ? 'New' : FILE_STATES[fileState];
+  meta.textContent = `${formatBytes(entry.size)} · ${label}`;
+  actions.replaceChildren(...fileActions(s, entry));
+}
+
+function fileActions(s, entry) {
+  if (entry.state === 'received') {
+    const link = el('a', 'save', 'Save');
+    link.href = entry.url;
+    link.download = entry.name;
+    link.setAttribute('aria-label', `Save ${entry.name}`);
+    return [link];
+  }
+  if (entry.state === 'offered' && s.role === 'receive') {
+    return [
+      actionButton('Decline', `Decline ${entry.name}`, '', () => respondOne(s, entry, false)),
+      actionButton('Accept', `Accept ${entry.name}`, 'primary', () => respondOne(s, entry, true)),
+    ];
+  }
+  return [];
+}
+
+function actionButton(text, label, className, onClick) {
+  const button = el('button', className, text);
+  button.type = 'button';
+  button.setAttribute('aria-label', label);
+  button.addEventListener('click', onClick);
+  return button;
 }
 
 function renderProgress(s) {
   if (state.session !== s) return;
   const now = performance.now();
+  const accepted = s.files.filter((e) => e.accepted);
+  const total = totalSize(accepted);
   let done = s.bytes;
-  if (s.finished) {
-    done = s.totalBytes;
-  } else if (s.role === 'send' && !s.closed) {
-    // Data still sitting in the browser's send queue hasn't actually left this device yet.
-    done = Math.max(0, s.bytes - s.channel.bufferedAmount);
-    s.fileEnds.forEach((end, i) => {
-      if (end <= done && s.fileState[i] === 'sending') setFileState(s, i, 'sent');
-    });
+  // Data still sitting in the browser's send queue hasn't actually left this device yet.
+  if (s.role === 'send' && !s.closed) done = Math.max(0, s.bytes - s.channel.bufferedAmount);
+
+  for (const e of s.files) {
+    if (e.state !== 'sending' && e.state !== 'receiving') continue;
+    const moved = e.state === 'sending' ? done - e.startBytes : e.received;
+    const percent = e.size ? Math.min(100, Math.max(0, Math.floor((moved / e.size) * 100))) : 100;
+    e.row.meta.textContent = `${formatBytes(e.size)} · ${FILE_STATES[e.state]} ${percent}%`;
   }
 
   // Smoothed speed, sampled twice a second.
@@ -782,14 +949,12 @@ function renderProgress(s) {
     speed.lastTime = now;
   }
 
-  $('transfer-progress').value = s.totalBytes ? done / s.totalBytes : (s.finished ? 1 : 0);
-  let text = `${formatBytes(done)} of ${formatBytes(s.totalBytes)}`;
-  if (s.finished) {
-    const seconds = (now - s.startTime) / 1000;
-    text += ` · done in ${formatDuration(seconds)}`;
-    if (seconds > 0.5) text += ` · avg ${formatBytes(s.totalBytes / seconds)}/s`;
-  } else if (!s.closed && speed.value > 0) {
-    text += ` · ${formatBytes(speed.value)}/s · about ${formatDuration((s.totalBytes - done) / speed.value)} left`;
+  const delivered = accepted.filter((e) => e.state === 'sent' || e.state === 'received').length;
+  const allDelivered = accepted.length > 0 && delivered === accepted.length;
+  $('transfer-progress').value = total ? Math.min(1, done / total) : (allDelivered ? 1 : 0);
+  let text = `${delivered} of ${plural(accepted.length, 'file')} · ${formatBytes(done)} of ${formatBytes(total)}`;
+  if (!s.closed && isBusy(s) && speed.value > 0) {
+    text += ` · ${formatBytes(speed.value)}/s · about ${formatDuration(Math.max(0, total - done) / speed.value)} left`;
   }
   $('transfer-stats').textContent = text;
 }
@@ -831,6 +996,12 @@ function init() {
   $('download-back').addEventListener('click', () => { declineIncoming(); goHome(); });
   $('btn-accept').addEventListener('click', acceptIncoming);
   $('btn-decline').addEventListener('click', declineIncoming);
+  $('btn-accept-all').addEventListener('click', () => respondAll(true));
+  $('btn-decline-all').addEventListener('click', () => respondAll(false));
+  $('more-input').addEventListener('change', (event) => {
+    sendMoreFiles(event.target.files);
+    event.target.value = '';
+  });
   $('btn-disconnect').addEventListener('click', () => {
     if (state.session) closeSession(state.session, 'You disconnected.', { notify: true });
   });

@@ -66,6 +66,7 @@
     <div id="incoming" class="card" role="alertdialog" aria-labelledby="incoming-title" hidden>
       <p id="incoming-title" class="incoming-title"></p>
       <ul id="incoming-files" class="file-list"></ul>
+      <p class="muted small">After you connect, they can send more files. You'll approve each one.</p>
       <div class="row">
         <button id="btn-decline" type="button">Decline</button>
         <button id="btn-accept" class="primary" type="button">Accept</button>
@@ -80,7 +81,21 @@
     <p id="transfer-route" class="muted small"></p>
     <progress id="transfer-progress" max="1" value="0"></progress>
     <p id="transfer-stats" class="muted small"></p>
+
+    <div id="pending" class="card" role="region" aria-labelledby="pending-text" hidden>
+      <p id="pending-text" class="incoming-title"></p>
+      <div class="row">
+        <button id="btn-decline-all" type="button">Decline all</button>
+        <button id="btn-accept-all" class="primary" type="button">Accept all</button>
+      </div>
+    </div>
+
     <ul id="transfer-files" class="file-list"></ul>
+
+    <div id="send-more" class="send-more" hidden>
+      <input id="more-input" class="visually-hidden" type="file" multiple>
+      <label for="more-input" class="button pick">Send more files</label>
+    </div>
     <div class="row">
       <button id="btn-disconnect" class="danger" type="button">Disconnect</button>
       <button id="btn-transfer-home" type="button" hidden>Back to home</button>

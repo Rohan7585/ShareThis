@@ -82,9 +82,10 @@ button.big { width: 100%; min-height: 96px; font-size: 1.375rem; }
 button.back { min-height: 40px; padding: 6px 12px; border: none; background: none; color: var(--accent); }
 
 .pick { width: 100%; }
-/* The real file input is visually hidden; show its keyboard focus on the label instead. */
-#file-input:focus-visible + .pick { outline: 3px solid var(--focus); outline-offset: 2px; }
-#file-input:disabled + .pick { opacity: .5; cursor: not-allowed; }
+/* The real file inputs are visually hidden; show their keyboard focus on the label instead. */
+input[type="file"]:focus-visible + .pick { outline: 3px solid var(--focus); outline-offset: 2px; }
+input[type="file"]:disabled + .pick { opacity: .5; cursor: not-allowed; }
+.send-more { margin-top: 16px; }
 
 .visually-hidden {
   position: absolute;
@@ -124,6 +125,11 @@ button.back { min-height: 40px; padding: 6px 12px; border: none; background: non
 .file[data-state="received"] .file-meta,
 .file[data-state="sent"] .file-meta { color: var(--ok); }
 .file[data-state="cancelled"] .file-meta { color: var(--danger); }
+.file[data-state="offered"] { border-color: var(--accent); }
+.file[data-state="declined"] .file-name { color: var(--muted); text-decoration: line-through; }
+
+.file-actions { display: flex; flex: none; gap: 8px; }
+.file-actions button { min-height: 40px; padding: 6px 12px; }
 
 .save {
   padding: 8px 14px;
